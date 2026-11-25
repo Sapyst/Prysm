@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -45,6 +46,7 @@ from .backend_manager import (
     import_local_neural_dir,
     install_neural_dll_from_git,
     install_vklayer,
+    read_dlssnr_config,
     read_helper_log,
     run_helper_cmd,
     set_helper_runner,
@@ -1520,12 +1522,31 @@ class DLSS5FilterWindow(QMainWindow):
 
 
 def main() -> int:
+    lock_dir = Path.home() / ".cache" / "dlssnr"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = (lock_dir / "prysm-gui.lock").open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            subprocess.run(["hyprctl", "dispatch", "focuswindow", "title:^Prysm"], capture_output=True)
+        return 0
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+
     app = QApplication(sys.argv)
-    app.setApplicationName("DLSS5 Filter Studio")
+    app.setApplicationName("Prysm")
     app.setStyleSheet(DARK_QSS)
     win = DLSS5FilterWindow()
     win.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
