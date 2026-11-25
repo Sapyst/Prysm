@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""dlss5-run — Wrapper universal para abrir qualquer jogo Vulkan ou Proton com filtro DLSS 5.
+
+Uso na Steam (Opções de Inicialização):
+  dlss5-run %command%
+
+Uso direto no terminal:
+  dlss5-run /caminho/do/jogo_vulkan [args...]
+  dlss5-run --proton /caminho/do/jogo.exe [args...]
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from dlss5_filter.backend_manager import discover_runners, read_dlssnr_config, run_helper_cmd, xdg_dirs
+from dlss5_filter.game_launcher import default_game_prefix_dir
+from dlss5_filter.overlay import overlay_sock_path, send_overlay_command
+from dlss5_filter.shm_bridge import ShmBridge
+
+
+def _shm_bridge() -> ShmBridge:
+    cfg_shm = os.environ.get("DLSSNR_SHM") or read_dlssnr_config().get("shm")
+    return ShmBridge(Path(cfg_shm)) if cfg_shm else ShmBridge()
+
+
+def _helper_is_running() -> bool:
+    snap = _shm_bridge().read_snapshot()
+    return bool(snap and snap.initialised and snap.helper_state == 4)
+
+
+def _gui_is_running() -> bool:
+    pid_file = _shm_bridge().path.parent / "gui.pid"
+    if not pid_file.is_file():
+        return False
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        return pid > 1 and Path(f"/proc/{pid}").exists()
+    except Exception:
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in {"-h", "--help"}:
+        print(__doc__ or "Uso: dlss5-run [--proton] <comando> [args...]")
+        return 0 if args else 2
+
+    proton_mode = False
+    start_off = os.environ.get("DLSS5_START_OFF") == "1"
+    while args and args[0] in {"--proton", "--off", "--start-off"}:
+        flag = args.pop(0)
+        if flag == "--proton":
+            proton_mode = True
+        else:
+            start_off = True
+
+    if not args:
+        print("erro: nenhum executável informado", file=sys.stderr)
+        return 2
+
+    started_by_us = False
+    if not _helper_is_running():
+        rc, out = run_helper_cmd("start")
+        if rc == 0:
+            started_by_us = True
+        else:
+            print(f"[dlss5-run] aviso: helper não iniciou ({out}); jogo rodará em pass-through.", file=sys.stderr)
+
+    if start_off:
+        try:
+            _shm_bridge().apply_settings({"enabled": 0, "applyModel": 0})
+        except Exception:
+            pass
+
+    env = os.environ.copy()
+    env["VKLayer_DLSS5"] = "1"
+    cfg_shm = read_dlssnr_config().get("shm")
+    if cfg_shm and "DLSSNR_SHM" not in env:
+        Path(cfg_shm).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        env["DLSSNR_SHM"] = cfg_shm
+
+    overlay_started_by_us = False
+    if env.get("DLSS5_NO_OVERLAY") != "1" and (env.get("HYPRLAND_INSTANCE_SIGNATURE") or env.get("WAYLAND_DISPLAY")):
+        if not overlay_sock_path().exists():
+            overlay_bin = ROOT / "dlss5-overlay"
+            if overlay_bin.exists():
+                subprocess.Popen(
+                    [str(overlay_bin), "--daemon", "--no-helper"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                overlay_started_by_us = True
+
+    game_env = env.copy()
+    if game_env.get("DLSS5_NO_PRIME") != "1":
+        game_env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+        game_env.setdefault("__VK_LAYER_NV_optimus", "NVIDIA_only")
+        game_env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+
+    cmd = args
+    if proton_mode:
+        exe = Path(args[0]).resolve()
+        runners = discover_runners()
+        if not runners:
+            print("erro: nenhum runner Proton ou Wine encontrado.", file=sys.stderr)
+            return 1
+        runner = runners[0]
+        pfx = Path(game_env.get("STEAM_COMPAT_DATA_PATH") or default_game_prefix_dir(exe))
+        pfx.mkdir(parents=True, exist_ok=True)
+        game_env["PROTON_ENABLE_NVAPI"] = "1"
+        game_env["DXVK_ENABLE_NVAPI"] = "1"
+        if runner.runner_type == "proton":
+            game_env["STEAM_COMPAT_DATA_PATH"] = str(pfx)
+            steam_root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "Steam"
+            if steam_root.is_dir():
+                game_env.setdefault("STEAM_COMPAT_CLIENT_INSTALL_PATH", str(steam_root))
+            cmd = [runner.path, "run", str(exe), *args[1:]]
+        else:
+            game_env["WINEPREFIX"] = str(pfx)
+            cmd = [runner.path, str(exe), *args[1:]]
+
+    try:
+        proc = subprocess.run(cmd, env=game_env)
+        return proc.returncode
+    finally:
+        keep = env.get("DLSS5_KEEP_HELPER") == "1" or _gui_is_running()
+        if overlay_started_by_us and not keep:
+            send_overlay_command("quit")
+        if started_by_us and not keep:
+            run_helper_cmd("stop")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

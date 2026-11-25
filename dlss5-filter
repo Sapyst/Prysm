@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""DLSS5 Filter Studio CLI and GUI launcher."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from dlss5_filter.backend_manager import (
+    get_backend_status,
+    install_neural_dll_from_git,
+    install_vklayer,
+    run_helper_cmd,
+)
+from dlss5_filter.optiscaler_manager import (
+    get_presr_status,
+    install_presr_in_game,
+    uninstall_presr_from_game,
+)
+from dlss5_filter.presets import BUILTIN_PRESETS
+from dlss5_filter.shm_bridge import ShmBridge
+
+
+def _norm(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower()) if unicodedata.category(c) != "Mn"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="dlss5-filter",
+        description="DLSS5 Filter Studio — utilizador unificado de filtro neural para Vulkan e Proton",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("gui", help="Abrir interface gráfica (padrão)")
+    sub.add_parser("setup", help="Instalar DLSS5VKLayer + baixar nvngx_dlssnr.dll 310.9.16")
+    sub.add_parser("start", help="Iniciar o helper neural em segundo plano")
+    sub.add_parser("stop", help="Parar o helper neural")
+    sub.add_parser("status", help="Mostrar estado do backend e da memória compartilhada")
+    sub.add_parser("doctor", help="Executar diagnóstico completo do dlssnr-helper")
+
+    p_preset = sub.add_parser("preset", help="Aplicar um preset rápido via SHM")
+    p_preset.add_argument("name", nargs="?", help="Nome (ou trecho) do preset")
+
+    p_presr = sub.add_parser("presr", help="Gerenciar OptiScaler-NR (Pre-SR) em pasta de jogo Proton")
+    p_presr.add_argument("action", choices=["install", "remove", "status"])
+    p_presr.add_argument("game_dir", help="Pasta onde fica o .exe real do jogo")
+    p_presr.add_argument("--hook", default="dxgi.dll", help="Nome da DLL hook (dxgi.dll, winmm.dll, dbghelp.dll...)")
+    p_presr.add_argument("--api", default="dx12", choices=["dx12", "dx11", "vulkan"], help="API gráfica do jogo")
+
+    p_ovl = sub.add_parser("overlay", help="Abrir/alternar menu overlay in-game (Page Up / Delete)")
+    p_ovl.add_argument("--daemon", action="store_true", help="Iniciar oculto aguardando atalho")
+    p_ovl.add_argument("--show", action="store_true", help="Abrir já visível")
+    p_ovl.add_argument("--toggle", action="store_true", help="Alternar overlay ativo")
+    p_ovl.add_argument("--quit", action="store_true", help="Encerrar overlay ativo")
+    p_ovl.add_argument("--key", choices=["Prior", "Delete"], help="Tecla de atalho (Prior=Page Up, Delete=Del)")
+
+    args = parser.parse_args(argv)
+    cmd = args.cmd or "gui"
+
+    if cmd == "gui":
+        from dlss5_filter.gui import main as gui_main
+        return gui_main()
+    if cmd == "overlay":
+        from dlss5_filter.overlay import main as overlay_main
+        ovl_args: list[str] = []
+        if args.daemon:
+            ovl_args.append("--daemon")
+        if args.show:
+            ovl_args.append("--show")
+        if args.toggle:
+            ovl_args.append("--toggle")
+        if args.quit:
+            ovl_args.append("--quit")
+        if args.key:
+            ovl_args.extend(["--key", args.key])
+        return overlay_main(ovl_args)
+    if cmd == "setup":
+        install_vklayer(print)
+        install_neural_dll_from_git(print)
+        print("Setup concluído com sucesso.")
+        return 0
+    if cmd in {"start", "stop", "doctor"}:
+        rc, out = run_helper_cmd(cmd)
+        if out:
+            print(out)
+        return rc
+    if cmd == "status":
+        st = get_backend_status()
+        snap = ShmBridge().read_snapshot()
+        print(f"GPU: {st.gpu_name} (Driver {st.driver_version})")
+        print(f"DLSS5VKLayer: {'OK' if st.vklayer_installed else 'Ausente'}")
+        print(f"nvngx_dlssnr.dll: {'OK' if st.neural_dll_ok else 'Ausente'} ({st.neural_dll_path})")
+        print(f"Runner helper: {st.configured_runner_type} -> {st.configured_runner_path}")
+        if snap and snap.initialised:
+            print(
+                f"SHM: state={snap.helper_state_label} model_up={snap.model_up} "
+                f"frames={snap.helper_frames} game={snap.game_name or '-'} "
+                f"({snap.layer_width}x{snap.layer_height})"
+            )
+        else:
+            print("SHM: não inicializada")
+        return 0
+    if cmd == "preset":
+        if not args.name:
+            for k in BUILTIN_PRESETS:
+                print(f"- {k}")
+            return 0
+        q = _norm(args.name)
+        match = next((k for k in BUILTIN_PRESETS if q in _norm(k)), None)
+        if not match:
+            print(f"Preset não encontrado: {args.name}", file=sys.stderr)
+            return 1
+        bridge = ShmBridge()
+        bridge.apply_settings(BUILTIN_PRESETS[match])
+        bridge.close()
+        print(f"Preset aplicado: {match}")
+        return 0
+    if cmd == "presr":
+        gdir = Path(args.game_dir).resolve()
+        if args.action == "install":
+            st = install_presr_in_game(gdir, hook_dll=args.hook, api_mode=args.api, log=print)
+            print(f"Steam Launch Options: {st.steam_launch_option}")
+            return 0
+        if args.action == "remove":
+            uninstall_presr_from_game(gdir, log=print)
+            return 0
+        st = get_presr_status(gdir)
+        print(f"Instalado: {st.installed} | Hook: {st.hook_dll} | API: {st.api_mode} | DLL Neural: {st.has_neural_dll}")
+        print(f"Steam Launch Options: {st.steam_launch_option}")
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
